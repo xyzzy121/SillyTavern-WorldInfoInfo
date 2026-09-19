@@ -22,6 +22,35 @@ Visibility and privacy
 
 ![report omits hidden books](https://github.com/aikohanasaki/imagehost/blob/main/wii-hiddenreport.png)
 
+## Unusual lorebook names (1.6.8)
+
+Activation capture now uses the host's structured lorebook name and entry UID
+whenever available, including current SillyTavern logs that split the entry
+header and lorebook name into separate arguments. Names are kept exactly as
+provided: apostrophes, quotes, colons, brackets, emoji, combining characters,
+spaces, and line breaks do not change entry identity. Long names wrap in the
+activity panel and keyword report.
+
+Entry attribution is scoped to the current processing block and cleared at scan,
+loop, and chat boundaries. Entries with the same UID in different lorebooks stay
+separate. Historical reports still accept the old `World:UID` identifiers and
+combined text logs; their keyword fallback stops at the next entry or loop. New
+reports use exact structured capture without replacing it with inferred log text.
+Existing hidden-lorebook visibility rules are unchanged. This display behavior
+does not change which lorebooks the host loads or who can access their files.
+
+To install this local checkout, copy the repository into
+`public/scripts/extensions/third-party/SillyTavern-WorldInfoInfo` in your
+SillyTavern installation, then reload SillyTavern. Replace an existing copy instead
+of loading two copies of the extension. No SillyTavern core patch is required.
+
+The regression suite requires Node.js 20 or newer and has no additional packages:
+
+```sh
+npm test
+npm run check
+```
+
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0. See [LICENSE](./LICENSE).

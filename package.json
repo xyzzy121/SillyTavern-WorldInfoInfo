@@ -1,0 +1,10 @@
+{
+  "name": "sillytavern-worldinfo-info",
+  "version": "1.6.8",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.js && node --check wi-log-parser.js"
+  }
+}

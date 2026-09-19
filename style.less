@@ -207,3 +207,23 @@
         transform: scale(1) translateY(0)
     }
 }
+
+// Keep exact names readable even when they contain whitespace or long words.
+.stwii--panel {
+    max-width: min(calc(100vw - 1em), max(18rem, calc((100vw - var(--sheldWidth)) / 2 - 3.5em)));
+}
+.stwii--entry,
+.stwii-report-container {
+    min-width: 0;
+}
+.stwii--world,
+.stwii--entry:not(.stwii--messages) .stwii--title,
+.stwii-report-container li {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+.stwii--strategy,
+.stwii--sticky {
+    flex-shrink: 0;
+}

@@ -1,3 +1,4 @@
+import { entryKey, normalizeEntryKey, parseEntryKey, parseDetailsFromLogs, WiLogTracker } from './wi-log-parser.js';
 import { chat, chat_metadata, event_types, eventSource, main_api, saveSettingsDebounced } from '../../../../script.js';
 import { metadata_keys } from '../../../authors-note.js';
 import { extension_settings } from '../../../extensions.js';
@@ -447,7 +448,7 @@ const init = ()=>{
         // Exclude disabled entries
         const filtered = entryList.filter(e => e?.disable !== true);
 
-        updateBadge(filtered.map(it=>`${it.world}§§§${it.uid}`));
+        updateBadge(filtered.map(it=>entryKey(it.world, it.uid)));
 
         for (const entry of filtered) {
             entry.type = 'wi';
@@ -753,11 +754,12 @@ const init = ()=>{
     let stwiiActiveLoopIndex = -1;
     let stwiiDryRunActive = false;
 function startBuildSession() {
-        STWII.currentRunId = Date.now();
+        STWII.currentRunId = Math.max(Date.now(), (STWII.currentRunId ?? 0) + 1);
         stwiiCurrentBuild = { runId: STWII.currentRunId, startedAt: Date.now(), added: [], logs: [] };
     }
 function endBuildSession() {
         if (!stwiiCurrentBuild) return;
+        if (stwiiDryRunActive) { stwiiCurrentBuild = null; return; }
         if (!Array.isArray(chat_metadata.stwiiBuilds)) chat_metadata.stwiiBuilds = [];
         chat_metadata.stwiiBuilds.push(stwiiCurrentBuild);
         // Enforce retention: last 5 builds; purge global events for dropped builds
@@ -765,433 +767,169 @@ function endBuildSession() {
         stwiiCurrentBuild = null;
     }
 
-    // WI activation log capture (no changes to world-info.js)
-    const activationDrafts = new Map();
-    // Track last seen world for a given numeric UID (engine logs sometimes omit the world on follow-up lines)
-    const lastWorldByUid = new Map();
-
-    // Build composite key helper "World:UID" or placeholder "?:UID" when world is unknown
-    function makeDraftKey(uid, world) {
-        const w = (typeof world === 'string' && world.length) ? world : null;
-        return w ? `${w}:${uid}` : `?:${uid}`;
-    }
-    function parseWiUIDFromFirstArg(a0) {
-        if (typeof a0 !== 'string') return null;
-        const m = a0.match(/\[WI\]\s+Entry\s+(\d+)/);
-        return m ? Number(m[1]) : null;
-    }
+    // Follow-up messages belong only to the current processing entry. Structured
+    // commits resolve exact world/UID drafts, including duplicate UIDs across books.
+    const logTracker = new WiLogTracker();
     function ensureEventArray() {
         if (!Array.isArray(chat_metadata.stwiiActivationEvents)) chat_metadata.stwiiActivationEvents = [];
     }
-    function upsertDraft(uid, worldOpt) {
-        // Prefer explicit world; fallback to last seen for this uid
-        const world = worldOpt || lastWorldByUid.get(uid) || null;
-
-        // If we now know the world, migrate any placeholder draft (?:uid) to composite
-        const placeholderKey = makeDraftKey(uid, null);
-        const key = makeDraftKey(uid, world);
-
-        if (world && activationDrafts.has(placeholderKey) && !activationDrafts.has(key)) {
-            activationDrafts.set(key, activationDrafts.get(placeholderKey));
-            activationDrafts.delete(placeholderKey);
-        }
-
-        if (!activationDrafts.has(key)) {
-            activationDrafts.set(key, { primary: null, secondary: [], secondaryNon: [], logic: null });
-        }
-        return activationDrafts.get(key);
-    }
     function handleWiDebugArgs(args) {
-        if (!args || args.length === 0) return;
-        const a0 = args[0];
+        const activation = logTracker.observe(args);
+        if (!activation || stwiiDryRunActive) return;
+        const { entry: entryObj, draft: d } = activation;
+        ensureEventArray();
+        // Fallback: if AND_ALL but no captured secondaries, include all entry secondaries
+        const sec = (d.logic === 'AND_ALL' && (!d.secondary || d.secondary.length === 0) && Array.isArray(entryObj.keysecondary))
+            ? [...entryObj.keysecondary]
+            : [...(d.secondary || []), ...(d.secondaryNon || [])];
 
-        if (typeof a0 === 'string' && /\[\s*WI\s*\]\s+WORLDINFO_FORCE_ACTIVATE\s+added entry/i.test(a0)) {
-            const entryObj = args[1];
-            const forceUid = Number(entryObj?.uid);
-            if (entryObj && typeof entryObj === 'object' && Number.isFinite(forceUid)) {
-                if (typeof entryObj.world === 'string' && entryObj.world.length) {
-                    lastWorldByUid.set(forceUid, entryObj.world);
-                }
-                const d = upsertDraft(forceUid, entryObj.world);
-                d.primary = null;
-                d.secondary = [];
-                d.secondaryNon = [];
-                d.logic = 'FORCE_ACTIVATE';
-            }
-            return;
+        const ev = {
+            ts: Date.now(),
+            world: entryObj.world,
+            uid: entryObj.uid,
+            comment: entryObj.comment ?? '',
+            constant: entryObj.constant === true,
+            vectorized: entryObj.vectorized === true,
+            keys: Array.isArray(entryObj.key) ? [...entryObj.key] : [],
+            captureVersion: 2,
+            primary: d.primary,
+            secondary: sec,
+            logic: d.logic,
+            reason: (() => {
+                if (entryObj.constant === true) return 'constant';
+                if (d.logic === 'FORCE_ACTIVATE') return 'force_activate';
+                if (typeof d.primary === 'string' && d.primary.length) return 'primary';
+                if (['AND_ANY','AND_ALL','NOT_ANY','NOT_ALL'].includes(d.logic)) return 'secondary';
+                if (entryObj.vectorized === true) return 'vector';
+                if (d.logic === 'PRIO_WINNER') return 'prio_winner';
+                return 'other';
+            })(),
+        };
+
+        ev.runId = (stwiiCurrentBuild && stwiiCurrentBuild.runId) ? stwiiCurrentBuild.runId : (window.STWII?.currentRunId ?? null);
+        ensureEventArray();
+        pushBounded(chat_metadata.stwiiActivationEvents, ev, STWII.MAX_ACTIVATION_EVENTS);
+
+        // Track per-loop event IDs if inside a loop
+        if (Array.isArray(stwiiCurrentLoopEventIds) && stwiiActiveLoopIndex >= 0) {
+            while (stwiiCurrentLoopEventIds.length <= stwiiActiveLoopIndex) stwiiCurrentLoopEventIds.push([]);
+            stwiiCurrentLoopEventIds[stwiiActiveLoopIndex].push(entryKey(entryObj.world, entryObj.uid));
         }
 
-        const uid = parseWiUIDFromFirstArg(a0);
-        if (uid == null) return;
+        // Track in current build session if present
+        if (stwiiCurrentBuild) stwiiCurrentBuild.added.push(ev);
 
-        const a1 = args[1];
-        const a2 = args[2];
-
-        // Normalize first arg as text (some WI logs are emitted as a single string line)
-        const text0 = (typeof a0 === 'string') ? a0 : '';
-
-        // Try to capture world name on "processing" lines: "[WI] Entry N from 'World' processing ..."
-        let worldFromLine = null;
-        try {
-            const mW = text0.match(/\bfrom\s+'([^']+)'\s+processing/i);
-            if (mW && mW[1]) worldFromLine = mW[1];
-        } catch {}
-        if (worldFromLine) {
-            lastWorldByUid.set(uid, worldFromLine);
-        }
-
-        // Support single-line formats to capture primary/secondary/logic from a0
-        try {
-            // Primary key match inline:
-            // e.g. "[WI] Entry 11 activated by primary key match kidnapped"
-            const mPrimLine = text0.match(/\[WI\]\s+Entry\s+\d+.*?activated by primary key match\s+(.+)/i);
-            if (mPrimLine && mPrimLine[1]) {
-                const d = upsertDraft(uid, worldFromLine);
-                d.primary = mPrimLine[1].trim();
-            }
-
-            // Also capture when the engine logs "Entry with primary key match X has secondary keywords"
-            // This often appears one line after "processing" and before the "(AND ANY) activated" line.
-            // Example: "Entry 21 Entry with primary key match custom has secondary keywords. Checking with logic logic (2) ['AND_ANY', 0]"
-            const mPrimHasSecondary = text0.match(/\bEntry with primary key match\s+(.+?)\s+has secondary keywords/i);
-            if (mPrimHasSecondary && mPrimHasSecondary[1]) {
-                const d = upsertDraft(uid, worldFromLine);
-                // Do not overwrite an already captured primary
-                d.primary = d.primary || mPrimHasSecondary[1].trim();
-            }
-
-            // Capture logic indicator when printed in the "Checking with logic logic (N) ['AND_ANY', 0]" form
-            const mLogicBracket = text0.match(/Checking with logic\s+logic\s*\(\d+\)\s*\[['"]?(AND_ANY|AND_ALL|NOT_ANY|NOT_ALL)['"]?/i);
-            if (mLogicBracket && mLogicBracket[1]) {
-                const d = upsertDraft(uid, worldFromLine);
-                d.logic = d.logic ?? mLogicBracket[1]; // keep underscore variant; renderer maps to display text
-            }
-
-            // Secondary captures inline (AND ANY)
-            const mSecAndAny = text0.match(/\(AND ANY\)\s*Found match secondary keyword\s+(.+)/i);
-            if (mSecAndAny && mSecAndAny[1]) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.secondary.push(mSecAndAny[1].trim());
-                d.logic = d.logic ?? 'AND_ANY';
-            }
-
-            // Secondary captures inline (NOT ALL)
-            const mSecNotAll = text0.match(/\(NOT ALL\)\s*Found not matching secondary keyword\s+(.+)/i);
-            if (mSecNotAll && mSecNotAll[1]) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.secondaryNon.push(mSecNotAll[1].trim());
-                d.logic = d.logic ?? 'NOT_ALL';
-            }
-
-            // Secondary logic inline (NOT ANY)
-            if (/\(NOT ANY\)\s*No secondary keywords found/i.test(text0)) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.logic = 'NOT_ANY';
-            }
-
-            // Secondary logic inline (AND ALL)
-            if (/\(AND ALL\)\s*All secondary keywords found/i.test(text0)) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.logic = 'AND_ALL';
-            }
-
-            // Priority winner inline
-            if (/activated as prio winner/i.test(text0)) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.logic = d.logic ?? 'PRIO_WINNER';
-            }
-
-            // Constant inline
-            if (/activated because of constant/i.test(text0)) {
-            const d = upsertDraft(uid, worldFromLine);
-                d.logic = d.logic ?? 'CONSTANT';
-            }
-        } catch {}
-
-        // Primary matched
-        if (a1 === 'activated by primary key match') {
-            const d = upsertDraft(uid);
-            if (typeof a2 === 'string') d.primary = a2;
-            return;
-        }
-
-        // Secondary logic captures
-        if (a1 === 'activated. (AND ANY) Found match secondary keyword') {
-            const d = upsertDraft(uid);
-            if (typeof a2 === 'string') d.secondary.push(a2);
-            d.logic = d.logic ?? 'AND_ANY';
-            return;
-        }
-
-        if (a1 === 'activated. (NOT ALL) Found not matching secondary keyword') {
-            const d = upsertDraft(uid);
-            if (typeof a2 === 'string') d.secondaryNon.push(a2);
-            d.logic = d.logic ?? 'NOT_ALL';
-            return;
-        }
-
-        if (a1 === 'activated. (NOT ANY) No secondary keywords found') {
-            const d = upsertDraft(uid);
-            d.logic = 'NOT_ANY';
-            return;
-        }
-
-        if (a1 === 'activated. (AND ALL) All secondary keywords found') {
-            const d = upsertDraft(uid);
-            d.logic = 'AND_ALL';
-            return;
-        }
-
-        // Priority winner (inclusion group) capture
-        if (typeof a1 === 'string' && a1.startsWith('activated as prio winner')) {
-            const d = upsertDraft(uid);
-            d.logic = d.logic ?? 'PRIO_WINNER';
-            return;
-        }
-
-        // Constant activation message (legacy/supportive)
-        if (typeof a1 === 'string' && a1.startsWith('activated because of constant')) {
-            const d = upsertDraft(uid);
-            d.logic = d.logic ?? 'CONSTANT';
-            return;
-        }
-
-        // Final activation commit
-        if (typeof a0 === 'string' && a0.includes('activation successful, adding to prompt')) {
-            const entryObj = args[1];
-            if (!entryObj || typeof entryObj !== 'object') return;
-            const compKey = makeDraftKey(entryObj.uid, entryObj.world);
-            const placeholderKey = makeDraftKey(entryObj.uid, null);
-            const d = activationDrafts.get(compKey) || activationDrafts.get(placeholderKey) || { primary: null, secondary: [], secondaryNon: [], logic: null };
-
-            ensureEventArray();
-            // Fallback: if AND_ALL but no captured secondaries, include all entry secondaries
-            const sec = (d.logic === 'AND_ALL' && (!d.secondary || d.secondary.length === 0) && Array.isArray(entryObj.keysecondary))
-                ? [...entryObj.keysecondary]
-                : (d.secondary || []);
-
-            const ev = {
-                ts: Date.now(),
-                world: entryObj.world,
-                uid: entryObj.uid,
-                comment: entryObj.comment ?? '',
-                constant: entryObj.constant === true,
-                vectorized: entryObj.vectorized === true,
-                keys: Array.isArray(entryObj.key) ? [...entryObj.key] : [],
-                primary: d.primary,
-                secondary: sec,
-                logic: d.logic,
-                reason: (() => {
-                    if (entryObj.constant === true) return 'constant';
-                    if (d.logic === 'FORCE_ACTIVATE') return 'force_activate';
-                    if (typeof d.primary === 'string' && d.primary.length) return 'primary';
-                    if (['AND_ANY','AND_ALL','NOT_ANY','NOT_ALL'].includes(d.logic)) return 'secondary';
-                    if (entryObj.vectorized === true) return 'vector';
-                    if (d.logic === 'PRIO_WINNER') return 'prio_winner';
-                    return 'other';
-                })(),
-            };
-
-            ev.runId = (stwiiCurrentBuild && stwiiCurrentBuild.runId) ? stwiiCurrentBuild.runId : (window.STWII?.currentRunId ?? null);
-            ensureEventArray();
-            pushBounded(chat_metadata.stwiiActivationEvents, ev, STWII.MAX_ACTIVATION_EVENTS);
-
-            // Track per-loop event IDs if inside a loop
-            if (Array.isArray(stwiiCurrentLoopEventIds) && stwiiActiveLoopIndex >= 0) {
-                while (stwiiCurrentLoopEventIds.length <= stwiiActiveLoopIndex) stwiiCurrentLoopEventIds.push([]);
-                stwiiCurrentLoopEventIds[stwiiActiveLoopIndex].push(`${entryObj.world}:${entryObj.uid}`);
-            }
-
-            // Track in current build session if present
-            if (stwiiCurrentBuild) stwiiCurrentBuild.added.push(ev);
-
-            activationDrafts.delete(compKey);
-            activationDrafts.delete(placeholderKey);
-            return;
-        }
     }
 
-    //! HACK: no event when no entries are activated, only a debug message
-    (function(){
-        const STWII = (window.STWII ||= {});
+    const resetCapture = () => {
+        logTracker.reset();
+        stwiiCurrentBuild = null;
+        stwiiCurrentLoopCounts = null;
+        stwiiCurrentLoopEntryIds = null;
+        stwiiCurrentLoopEventIds = null;
+        stwiiActiveLoopIndex = -1;
+        stwiiDryRunActive = false;
+        STWII.currentRunId = null;
+        currentEntryList = [];
+        currentChat = [];
+        panel.textContent = 'No active entries';
+        updateBadge([]);
+    };
+    eventSource.on(event_types.CHAT_CHANGED, resetCapture);
+
+    // The host has no entry-keyword event, so observe its WI diagnostics while
+    // forwarding every original console call unchanged.
+    function captureWiLog(args) {
+        const first = typeof args[0] === 'string' ? args[0] : '';
+        const asText = args.filter(arg => typeof arg === 'string').join(' ');
+        if (!/^\[WI\]/.test(first)) return;
+        const isStart = /^\[WI\]\s+--- START WI SCAN/.test(first);
+        const isBuilding = /^\[WI\]\s+--- BUILDING PROMPT ---/.test(first);
+        const isDone = /^\[WI\]\s+--- DONE(?: \(DRY RUN\))? ---/.test(first);
+        if (isStart) {
+            stwiiDryRunActive = first.includes('(DRY RUN)');
+            stwiiCurrentLoopCounts = [];
+            stwiiCurrentLoopEntryIds = [];
+            stwiiCurrentLoopEventIds = [];
+            stwiiActiveLoopIndex = -1;
+            startBuildSession();
+        }
+        if (isBuilding && !stwiiCurrentBuild) startBuildSession();
+        if (stwiiCurrentBuild && asText) pushBounded(stwiiCurrentBuild.logs, asText, STWII.MAX_BUILD_LOGS);
+
+        const loopStart = first.match(/^\[WI\]\s+---\s+LOOP\s+#(\d+)\s+START\s+---/i);
+        if (loopStart && Array.isArray(stwiiCurrentLoopEventIds)) {
+            const index = Number(loopStart[1]) - 1;
+            if (Number.isSafeInteger(index) && index >= 0) {
+                while (stwiiCurrentLoopEventIds.length <= index) stwiiCurrentLoopEventIds.push([]);
+                while (stwiiCurrentLoopCounts.length <= index) stwiiCurrentLoopCounts.push(0);
+                while (stwiiCurrentLoopEntryIds.length <= index) stwiiCurrentLoopEntryIds.push(null);
+                stwiiActiveLoopIndex = index;
+            }
+        }
+        handleWiDebugArgs(args);
+        if (/^\[WI\]\s+---\s+LOOP\s+#\d+\s+RESULT\s+---/i.test(first)) stwiiActiveLoopIndex = -1;
+
+        const loopResult = first.match(/^\[WI\]\s+Successfully\s+activated\s+(\d+)\s+new\s+entries\s+to\s+prompt/i);
+        if (loopResult && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
+            const count = Number(loopResult[1]);
+            const entries = args.find(arg => Array.isArray(arg) && arg.length === count
+                && arg.every(entry => entry && typeof entry.world === 'string' && Number.isSafeInteger(entry.uid)));
+            const ids = entries ? entries.map(entry => entryKey(entry.world, entry.uid)) : null;
+            const index = stwiiCurrentLoopCounts.length - 1;
+            if (index < 0) {
+                stwiiCurrentLoopCounts.push(count);
+                stwiiCurrentLoopEntryIds.push(ids);
+            } else {
+                stwiiCurrentLoopCounts[index] = count;
+                stwiiCurrentLoopEntryIds[index] = ids;
+            }
+        }
+        if (isBuilding && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
+            chat_metadata.stwiiLastLoopCounts = [...stwiiCurrentLoopCounts];
+            // The engine's result array can include budget-excluded entries. Prefer
+            // actual commit IDs whenever present, preserving array fallback for old hosts.
+            chat_metadata.stwiiLastLoopEntryIds = stwiiCurrentLoopCounts.map((_, index) => {
+                const committed = stwiiCurrentLoopEventIds?.[index];
+                return Array.isArray(committed) ? [...committed] : stwiiCurrentLoopEntryIds?.[index] ?? null;
+            });
+        }
+        const added = first.match(/^\[WI\]\s+Adding\s+(\d+)\s+entries\s+to\s+prompt\b/i);
+        if (added && !stwiiDryRunActive) chat_metadata.stwiiLastAddedCount = Number(added[1]);
+        if (isDone) {
+            endBuildSession();
+            stwiiDryRunActive = false;
+        }
+        if (/^\[WI\] (?:Found 0 world lore entries\. Sorted by strategy|Adding 0 entries to prompt)/.test(first)) {
+            panel.textContent = 'No active entries';
+            updateBadge([]);
+            currentEntryList = [];
+        }
+    }
+    (function patchConsole() {
         if (STWII.consolePatched) return;
         STWII.origDebug = console.debug;
         STWII.origLog = console.log;
-    const original_debug = console.debug;
-    console.debug = function(...args) {
-        // capture WI activation details
-        try { handleWiDebugArgs(args); } catch {}
-
-        // Track build session boundaries and capture counts (ignore DRY RUNs)
-        try {
-            const first = String(args[0] ?? '');
-            const asText = args.map(a => (typeof a === 'string' ? a : '')).join(' ');
-            if (stwiiCurrentBuild && asText) pushBounded(stwiiCurrentBuild.logs, asText, STWII.MAX_BUILD_LOGS);
-
-            // Start/end markers
-            if (asText.includes('[WI] --- START WI SCAN') && !stwiiCurrentBuild) startBuildSession();
-            if (first.includes('--- BUILDING PROMPT ---') && !stwiiCurrentBuild) startBuildSession();
-            if (first.includes('--- DONE ---')) endBuildSession();
-
-            // Detect WI scan start to reset loop counts; track DRY RUNs
-            if (asText.includes('[WI] --- START WI SCAN')) {
-                stwiiDryRunActive = asText.includes('(DRY RUN)');
-                stwiiCurrentLoopCounts = [];
-                stwiiCurrentLoopEntryIds = [];
-                stwiiCurrentLoopEventIds = [];
-                stwiiActiveLoopIndex = -1;
-            }
-
-            // Capture per-loop counts (non-dry run only), and try to capture the array of entries printed by engine
-            const mLoop = asText.match(/Successfully\s+activated\s+(\d+)\s+new\s+entries\s+to\s+prompt/i);
-            if (mLoop && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
-                const n = Number(mLoop[1]);
-                if (Number.isFinite(n)) {
-                    stwiiCurrentLoopCounts.push(n);
-                    if (Array.isArray(stwiiCurrentLoopEntryIds)) {
-                        let ids = null;
-                        try {
-                            for (const arg of args) {
-                                if (Array.isArray(arg) && arg.length === n && arg.every(o => o && typeof o === 'object' && ('uid' in o) && ('world' in o))) {
-                                    ids = arg.map(o => `${o.world}:${o.uid}`);
-                                    break;
-                                }
-                            }
-                        } catch {}
-                        stwiiCurrentLoopEntryIds.push(ids);
-                    }
-                }
-            }
-
-            // On BUILDING PROMPT, finalize loop counts (and captured entry IDs) for non-dry run
-            if (asText.includes('[WI] --- BUILDING PROMPT ---') && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
-                chat_metadata.stwiiLastLoopCounts = [...stwiiCurrentLoopCounts];
-                if (Array.isArray(stwiiCurrentLoopEntryIds)) {
-                    chat_metadata.stwiiLastLoopEntryIds = stwiiCurrentLoopEntryIds.map(a => Array.isArray(a) ? [...a] : null);
-                }
-            }
-
-            // Capture final "Adding N entries to prompt" (ignore "Hypothetically")
-            const mAdd = asText.match(/\[\s*WI\s*\]\s+Adding\s+(\d+)\s+entries\s+to\s+prompt\b/i);
-            if (mAdd && !stwiiDryRunActive) {
-                const n = Number(mAdd[1]);
-                if (Number.isFinite(n)) chat_metadata.stwiiLastAddedCount = n;
-            }
-        } catch {}
-
-        const triggers = [
-            '[WI] Found 0 world lore entries. Sorted by strategy',
-            '[WI] Adding 0 entries to prompt',
-        ];
-        if (triggers.includes(args[0])) {
-            panel.innerHTML = 'No active entries';
-            updateBadge([]);
-            currentEntryList = [];
-        }
-        return original_debug.bind(console)(...args);
-    };
-    const original_log = console.log;
-    console.log = function(...args) {
-        // capture WI activation details (just in case)
-        try { handleWiDebugArgs(args); } catch {}
-
-        // Track build session boundaries and capture counts (ignore DRY RUNs)
-        try {
-            const first = String(args[0] ?? '');
-            const asText = args.map(a => (typeof a === 'string' ? a : '')).join(' ');
-            if (stwiiCurrentBuild && asText) pushBounded(stwiiCurrentBuild.logs, asText, STWII.MAX_BUILD_LOGS);
-
-            // Start/end markers
-            if (asText.includes('[WI] --- START WI SCAN') && !stwiiCurrentBuild) startBuildSession();
-            if (first.includes('--- BUILDING PROMPT ---') && !stwiiCurrentBuild) startBuildSession();
-            if (first.includes('--- DONE ---')) endBuildSession();
-
-            // Loop delimiters for per-loop collection
-            const mLoopStart = asText.match(/\[WI\]\s+---\s+LOOP\s+#(\d+)\s+START\s+---/i);
-            if (mLoopStart && Array.isArray(stwiiCurrentLoopEventIds)) {
-                const idx = Number(mLoopStart[1]) - 1;
-                if (Number.isFinite(idx) && idx >= 0) {
-                    while (stwiiCurrentLoopEventIds.length <= idx) stwiiCurrentLoopEventIds.push([]);
-                    stwiiActiveLoopIndex = idx;
-                }
-            }
-            const mLoopResult = asText.match(/\[WI\]\s+---\s+LOOP\s+#(\d+)\s+RESULT\s+---/i);
-            if (mLoopResult) {
-                stwiiActiveLoopIndex = -1;
-            }
-
-            // Detect WI scan start to reset loop counts; track DRY RUNs
-            if (asText.includes('[WI] --- START WI SCAN')) {
-                stwiiDryRunActive = asText.includes('(DRY RUN)');
-                stwiiCurrentLoopCounts = [];
-                stwiiCurrentLoopEntryIds = [];
-            }
-
-            // Capture per-loop counts (non-dry run only), and try to capture the array of entries printed by engine
-            const mLoop = asText.match(/Successfully\s+activated\s+(\d+)\s+new\s+entries\s+to\s+prompt/i);
-            if (mLoop && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
-                const n = Number(mLoop[1]);
-                if (Number.isFinite(n)) {
-                    stwiiCurrentLoopCounts.push(n);
-                    if (Array.isArray(stwiiCurrentLoopEntryIds)) {
-                        let ids = null;
-                        try {
-                            for (const arg of args) {
-                                if (Array.isArray(arg) && arg.length === n && arg.every(o => o && typeof o === 'object' && ('uid' in o) && ('world' in o))) {
-                                    ids = arg.map(o => `${o.world}:${o.uid}`);
-                                    break;
-                                }
-                            }
-                        } catch {}
-                        stwiiCurrentLoopEntryIds.push(ids);
-                    }
-                }
-            }
-
-            // On BUILDING PROMPT, finalize loop counts (and captured entry IDs) for non-dry run
-            if (asText.includes('[WI] --- BUILDING PROMPT ---') && !stwiiDryRunActive && Array.isArray(stwiiCurrentLoopCounts)) {
-                chat_metadata.stwiiLastLoopCounts = [...stwiiCurrentLoopCounts];
-                // Prefer ids captured via LOOP START/RESULT + activation commits; fallback to ids captured from success-line arrays
-                let finalIds = null;
-                if (Array.isArray(stwiiCurrentLoopEventIds) && stwiiCurrentLoopEventIds.some(a => Array.isArray(a) && a.length)) {
-                    finalIds = stwiiCurrentLoopEventIds.map(a => Array.isArray(a) ? [...a] : null);
-                } else if (Array.isArray(stwiiCurrentLoopEntryIds)) {
-                    finalIds = stwiiCurrentLoopEntryIds.map(a => Array.isArray(a) ? [...a] : null);
-                }
-                if (finalIds) {
-                    chat_metadata.stwiiLastLoopEntryIds = finalIds;
-                }
-            }
-
-            // Capture final "Adding N entries to prompt" (ignore "Hypothetically")
-            const mAdd = asText.match(/\[\s*WI\s*\]\s+Adding\s+(\d+)\s+entries\s+to\s+prompt\b/i);
-            if (mAdd && !stwiiDryRunActive) {
-                const n = Number(mAdd[1]);
-                if (Number.isFinite(n)) chat_metadata.stwiiLastAddedCount = n;
-            }
-        } catch {}
-
-        const triggers = [
-            '[WI] Found 0 world lore entries. Sorted by strategy',
-            '[WI] Adding 0 entries to prompt',
-        ];
-        if (triggers.includes(args[0])) {
-            panel.innerHTML = 'No active entries';
-            updateBadge([]);
-            currentEntryList = [];
-        }
-        return original_log.bind(console)(...args);
-    };
-    STWII.unpatchConsole = function() {
-        try { console.debug = STWII.origDebug; } catch {}
-        try { console.log = STWII.origLog; } catch {}
-        STWII.consolePatched = false;
-    };
-    STWII.consolePatched = true;
-})();
+        const wrap = original => function(...args) {
+            try { captureWiLog(args); } catch { /* Diagnostics must never interrupt generation. */ }
+            return Reflect.apply(original, console, args);
+        };
+        const debugWrapper = wrap(STWII.origDebug);
+        const logWrapper = wrap(STWII.origLog);
+        console.debug = debugWrapper;
+        console.log = logWrapper;
+        STWII.unpatchConsole = () => {
+            if (console.debug === debugWrapper) console.debug = STWII.origDebug;
+            if (console.log === logWrapper) console.log = STWII.origLog;
+            STWII.consolePatched = false;
+        };
+        STWII.consolePatched = true;
+    })();
 
 // Optional teardown to remove UI and unpatch console
 window.STWII.destroy = function() {
+    eventSource.removeListener(event_types.CHAT_CHANGED, resetCapture);
+    resetCapture();
     try { window.STWII.unpatchConsole?.(); } catch {}
     try {
         const t = window.STWII.trigger;
@@ -1288,12 +1026,12 @@ window.STWII.destroy = function() {
             const loopRanges = [];
             if (logLines.length) {
                 for (let i = 0; i < logLines.length; i++) {
-                    const mStart = (logLines[i] || '').match(/\[WI\]\s+---\s+LOOP\s+#(\d+)\s+START\s+---/i);
+                    const mStart = (logLines[i] || '').match(/^\[WI\]\s+---\s+LOOP\s+#(\d+)\s+START\s+---/i);
                     if (mStart) {
                         const n = Number(mStart[1]);
                         let j = i + 1;
                         for (; j < logLines.length; j++) {
-                            const mEnd = (logLines[j] || '').match(/\[WI\]\s+---\s+LOOP\s+#(\d+)\s+RESULT\s+---/i);
+                            const mEnd = (logLines[j] || '').match(/^\[WI\]\s+---\s+LOOP\s+#(\d+)\s+(?:START|RESULT)\s+---/i);
                             if (mEnd) break;
                         }
                         loopRanges[n - 1] = [i, j];
@@ -1302,98 +1040,21 @@ window.STWII.destroy = function() {
             }
             const idsByLoopDiag = Array.isArray(chat_metadata.stwiiLastLoopEntryIds) ? chat_metadata.stwiiLastLoopEntryIds : null;
             const overrideById = new Map();
-            if (idsByLoopDiag && idsByLoopDiag.length && loopRanges.length && logLines.length) {
-                for (let i = 0; i < idsByLoopDiag.length; i++) {
-                    const ids = idsByLoopDiag[i];
-                    if (!Array.isArray(ids)) continue;
-                    const range = loopRanges[i];
-                    const start = Array.isArray(range) ? range[0] : 0;
-                    const end = Array.isArray(range) ? range[1] : (logLines.length - 1);
-                    for (const id of ids) {
-                        const parts = String(id).split(':');
-                        const uid = Number(parts.at(-1));
-                        const worldName = parts.slice(0, -1).join(':') || null;
-                        if (!Number.isFinite(uid)) continue;
-                        let idx = -1;
-                        for (let k = start; k <= end; k++) {
-                            const ln = logLines[k] || '';
-                            const matchesUid = ln.includes(`[WI] Entry ${uid} `) && ln.includes('processing');
-                            const matchesWorld = worldName ? ln.includes(`from '${worldName}' processing`) : true;
-                            if (matchesUid && matchesWorld) { idx = k; break; }
-                        }
-                        if (idx < 0) continue;
-                        // Scan a short window after the processing line to robustly capture primary/logic/secondary
-                        let prim = null, logic = null, sec = [];
-                        for (let k2 = idx + 1; k2 <= Math.min(end, idx + 6); k2++) {
-                            const lnN = logLines[k2] || '';
-                            if (!prim) {
-                                let m1 = lnN.match(/activated by primary key match\s+(.+)/i);
-                                if (m1 && m1[1]) prim = m1[1].trim();
-                                if (!prim) {
-                                    const m2 = lnN.match(/Entry with primary key match\s+(.+?)\s+has secondary keywords/i);
-                                    if (m2 && m2[1]) prim = m2[1].trim();
-                                }
-                            }
-                            if (!logic) {
-                                const m3 = lnN.match(/activated\.\s+\((AND ANY|AND ALL|NOT ANY|NOT ALL)\)\s*(?:Found (?:match|not matching) secondary keyword\s+(.+)|No secondary keywords found|All secondary keywords found)/i);
-                                if (m3) {
-                                    logic = m3[1].replace(/\s+/g, '_');
-                                    if (m3[2]) sec.push(m3[2].trim());
-                                }
-                                // Also catch the "Checking with logic logic (N) ['AND_ANY', 0]" variant
-                                const mLogicBracket2 = lnN.match(/Checking with logic\s+logic\s*\(\d+\)\s*\[['"]?(AND_ANY|AND_ALL|NOT_ANY|NOT_ALL)['"]?/i);
-                                if (mLogicBracket2 && mLogicBracket2[1] && !logic) {
-                                    logic = mLogicBracket2[1];
-                                }
-                            }
-                        }
-                        if (prim || sec.length || logic) {
-                            overrideById.set(String(id), { primary: prim || null, logic: logic || null, secondary: sec });
-                        }
-                    }
+            for (let i = 0; i < (idsByLoopDiag?.length ?? 0); i++) {
+                if (!Array.isArray(idsByLoopDiag[i])) continue;
+                const [start, end] = loopRanges[i] ?? [0, logLines.length - 1];
+                for (const id of idsByLoopDiag[i]) {
+                    const identity = parseEntryKey(id);
+                    if (!identity) continue;
+                    const details = parseDetailsFromLogs(logLines, identity.uid, identity.world, start, end);
+                    if (details) overrideById.set(entryKey(identity.world, identity.uid), details);
                 }
             }
-
-            // Diagnostic fallback: parse primary/secondary by scanning all logs for the given UID
-            function parseFromLogsByUid(lines, uid, world) {
-                if (!Array.isArray(lines) || !Number.isFinite(uid)) return null;
-                let lastIdx = -1;
-                for (let i = 0; i < lines.length; i++) {
-                    const t = lines[i] || '';
-                    const matchesUid = t.includes(`[WI] Entry ${uid} `) && t.includes('processing');
-                    const matchesWorld = world ? t.includes(`from '${world}' processing`) : true;
-                    if (matchesUid && matchesWorld) {
-                        lastIdx = i;
-                    }
-                }
-                if (lastIdx < 0) return null;
-                // Scan a small window after the processing line to extract details even if interleaved
-                let prim = null, logic = null, sec = [];
-                for (let k = lastIdx + 1; k <= Math.min(lines.length - 1, lastIdx + 6); k++) {
-                    const lnN = lines[k] || '';
-                    if (!prim) {
-                        let m1 = lnN.match(/activated by primary key match\s+(.+)/i);
-                        if (m1 && m1[1]) prim = m1[1].trim();
-                        if (!prim) {
-                            const m2 = lnN.match(/Entry with primary key match\s+(.+?)\s+has secondary keywords/i);
-                            if (m2 && m2[1]) prim = m2[1].trim();
-                        }
-                    }
-                    if (!logic) {
-                        const m3 = lnN.match(/activated\.\s+\((AND ANY|AND ALL|NOT ANY|NOT ALL)\)\s*(?:Found (?:match|not matching) secondary keyword\s+(.+)|No secondary keywords found|All secondary keywords found)/i);
-                        if (m3) {
-                            logic = m3[1].replace(/\s+/g, '_');
-                            if (m3[2]) sec.push(m3[2].trim());
-                        }
-                        // Also catch logic-only bracket line
-                        const mLogicBracket2 = lnN.match(/Checking with logic\s+logic\s*\(\d+\)\s*\[['"]?(AND_ANY|AND_ALL|NOT_ANY|NOT_ALL)['"]?/i);
-                        if (mLogicBracket2 && mLogicBracket2[1] && !logic) {
-                            logic = mLogicBracket2[1];
-                        }
-                    }
-                }
-                if (prim || sec.length || logic) return { primary: prim || null, logic: logic || null, secondary: sec };
-                return null;
+            function historicalDetails(ev) {
+                // Current structured captures are authoritative. Logs only repair older reports.
+                if (ev.captureVersion === 2) return null;
+                return overrideById.get(entryKey(ev.world, ev.uid))
+                    ?? parseDetailsFromLogs(logLines, ev.uid, ev.world);
             }
 
             // Build frequency map: keyword -> { count, entries: Set<string> }
@@ -1421,7 +1082,7 @@ window.STWII.destroy = function() {
             if (events.length) {
                 for (const ev of events) {
                     const entryIdent = fmtEntry(ev);
-                    const ov = overrideById.get(`${ev.world}:${ev.uid}`) || parseFromLogsByUid(logLines, ev.uid, ev.world) || null;
+                    const ov = historicalDetails(ev);
                     const primaryUse = ov && ov.primary ? ov.primary : (ev.primary || null);
                     const secondaryUse = ov && Array.isArray(ov.secondary) ? ov.secondary : (Array.isArray(ev.secondary) ? ev.secondary : []);
                     const kws = isForceActivatedEvent(ev, primaryUse, secondaryUse)
@@ -1482,14 +1143,14 @@ window.STWII.destroy = function() {
                 loopDiv.classList.add('stwii-report-summary');
 
                 const idsByLoop = Array.isArray(chat_metadata.stwiiLastLoopEntryIds) ? chat_metadata.stwiiLastLoopEntryIds : null;
-                const validIds = new Set(events.map(ev => `${ev.world}:${ev.uid}`));
+                const validIds = new Set(events.map(ev => entryKey(ev.world, ev.uid)));
 
                 const pieces = loops.map((n, i) => {
                     let shown = Number.isFinite(n) ? n : 0;
 
                     if (idsByLoop && Array.isArray(idsByLoop[i])) {
                         // Use precise ID mapping when available, then filter by visible events
-                        shown = idsByLoop[i].filter(id => validIds.has(id)).length;
+                        shown = idsByLoop[i].filter(id => validIds.has(normalizeEntryKey(id))).length;
                     } else {
                         // Fallback approximation: slice by original loop sizes but count only visible events in that range
                         const start = loops.slice(0, i).reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
@@ -1582,9 +1243,9 @@ window.STWII.destroy = function() {
 
                     let list = [];
                     const idsByLoop = Array.isArray(chat_metadata.stwiiLastLoopEntryIds) ? chat_metadata.stwiiLastLoopEntryIds : null;
-                    if (idsByLoop && Array.isArray(idsByLoop[i]) && idsByLoop[i]?.length === cnt) {
-                        const byId = new Map(events.map(ev => [`${ev.world}:${ev.uid}`, ev]));
-                        list = idsByLoop[i].map(id => byId.get(id)).filter(Boolean);
+                    if (idsByLoop && Array.isArray(idsByLoop[i])) {
+                        const byId = new Map(events.map(ev => [entryKey(ev.world, ev.uid), ev]));
+                        list = idsByLoop[i].map(id => byId.get(normalizeEntryKey(id))).filter(Boolean);
                     } else {
                         const start = offset;
                         const end = Math.min(events.length, start + (Number.isFinite(cnt) ? cnt : 0));
@@ -1607,7 +1268,7 @@ window.STWII.destroy = function() {
                             // Examples:
                             //  - "king AND ANY rainbow"
                             //  - "running NOT ANY circle"
-                        const ov2 = overrideById.get(`${ev.world}:${ev.uid}`) || parseFromLogsByUid(logLines, ev.uid, ev.world) || null;
+                        const ov2 = historicalDetails(ev);
                         const primaryKw = ov2 && ov2.primary ? ov2.primary : (ev && ev.primary ? ev.primary : null);
                         const secRaw = ov2 && Array.isArray(ov2.secondary) ? ov2.secondary.filter(Boolean) : (ev && Array.isArray(ev.secondary) ? ev.secondary.filter(Boolean) : []);
                         const uniqSec = Array.from(new Set(secRaw));
