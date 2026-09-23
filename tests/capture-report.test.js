@@ -11,6 +11,8 @@ class Element {
     children = [];
     classes = new Set();
     style = {};
+    offsetWidth = 40;
+    offsetHeight = 32;
     ownText = '';
     classList = {
         add: (...values) => values.forEach(value => this.classes.add(value)),
@@ -19,28 +21,32 @@ class Element {
     };
     append(...children) { this.children.push(...children); }
     addEventListener() {}
+    getBoundingClientRect() { return { left: 0, top: 0, right: 40, bottom: 32 }; }
     setAttribute() {}
     set innerHTML(value) { this.children = []; this.ownText = value; }
     get textContent() { return this.ownText + this.children.map(child => child.textContent).join(' '); }
     set textContent(value) { this.children = []; this.ownText = String(value); }
 }
 
-function fixture(admin = true, handle = 'alice') {
+function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
     const commands = {};
     const metadata = {};
     const eventSource = new EventEmitter();
     const consoleCalls = [];
     let popup = null;
+    let saves = 0;
+    const windowEvents = {};
     const context = {
         ...parser,
         console: { debug: (...args) => consoleCalls.push(args), log: (...args) => consoleCalls.push(args) },
-        window: { addEventListener() {} },
+        window: { innerWidth: 390, innerHeight: 844, addEventListener(name, listener) { windowEvents[name] = listener; } },
+        CSS: { supports: () => false },
         document: { createElement: () => new Element(), body: new Element() },
         chat: [], chat_metadata: metadata, main_api: 'openai',
-        extension_settings: {}, metadata_keys: {}, world_info_position: {},
+        extension_settings: extensionSettings, metadata_keys: {}, world_info_position: {},
         event_types: { GENERATION_STARTED: 'generation', CHAT_CHANGED: 'chat', WORLD_INFO_ACTIVATED: 'activated' },
         eventSource,
-        saveSettingsDebounced() {},
+        saveSettingsDebounced() { saves++; },
         isAdmin: () => admin,
         getCurrentUserHandle: () => handle,
         delay: async () => {},
@@ -55,10 +61,46 @@ function fixture(admin = true, handle = 'alice') {
     runInNewContext(source, context);
     return {
         context, metadata, eventSource, consoleCalls,
+        resize(width, height) {
+            context.window.innerWidth = width;
+            context.window.innerHeight = height;
+            windowEvents.resize();
+        },
+        get saves() { return saves; },
         log: (...args) => context.console.debug(...args),
         async report() { await commands['wi-report'].callback(); return popup.textContent; },
     };
 }
+
+test('a saved desktop trigger position is visible on the first phone load and after rotation', () => {
+    const settings = { worldInfoInfo: { triggerPos: { left: 1100, top: 900 } } };
+    const f = fixture(true, 'alice', settings);
+    const trigger = f.context.window.STWII.trigger;
+    assert.equal(trigger.style.left, '350px');
+    assert.equal(trigger.style.top, '812px');
+    assert.deepEqual(settings.worldInfoInfo.triggerPos, { left: 350, top: 812 });
+    assert.equal(f.saves, 1);
+    f.resize(844, 390);
+    assert.equal(trigger.style.left, '350px');
+    assert.equal(trigger.style.top, '358px');
+    assert.equal(f.saves, 2);
+    f.resize(844, 390);
+    assert.equal(f.saves, 2, 'an unchanged position does not save repeatedly');
+});
+
+test('default, valid, and negative saved trigger positions are handled independently', () => {
+    const defaults = fixture();
+    assert.equal(defaults.context.window.STWII.trigger.style.left, undefined);
+    assert.equal(defaults.context.extension_settings.worldInfoInfo?.triggerPos, undefined);
+    assert.equal(defaults.saves, 0);
+    const valid = fixture(true, 'alice', { worldInfoInfo: { triggerPos: { left: 12, top: 30 } } });
+    assert.equal(valid.context.window.STWII.trigger.style.left, '12px');
+    assert.equal(valid.context.window.STWII.trigger.style.top, '30px');
+    assert.equal(valid.saves, 0);
+    const negative = fixture(true, 'alice', { worldInfoInfo: { triggerPos: { left: -15, top: -20 } } });
+    assert.equal(negative.context.window.STWII.trigger.style.left, '0px');
+    assert.equal(negative.context.window.STWII.trigger.style.top, '0px');
+});
 
 function start(f, dry = false) {
     f.log(`[WI] --- START WI SCAN (on 2 messages, trigger = normal)${dry ? ' (DRY RUN)' : ''} ---`);

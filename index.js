@@ -211,20 +211,28 @@ const init = ()=>{
         STWII.trigger = trigger; STWII.panel = panel; STWII.configPanel = configPanel;
     }
 
-    // Apply saved position if present
-    {
-        const savedPos = extension_settings.worldInfoInfo?.triggerPos;
-        if (savedPos && Number.isFinite(savedPos.left) && Number.isFinite(savedPos.top)) {
-            trigger.style.left = savedPos.left + 'px';
-            trigger.style.top = savedPos.top + 'px';
-            trigger.style.right = 'auto';
-            trigger.style.bottom = 'auto';
-        }
-    }
+    // A position saved on a larger screen must remain reachable on first load.
+    clampSavedTriggerPosition();
 
     // Drag-to-move handlers and helpers
     function clamp(val, min, max) {
         return Math.max(min, Math.min(max, val));
+    }
+
+    function clampSavedTriggerPosition() {
+        const pos = extension_settings.worldInfoInfo?.triggerPos;
+        if (!pos || !Number.isFinite(pos.left) || !Number.isFinite(pos.top)) return;
+        const left = clamp(pos.left, 0, window.innerWidth - trigger.offsetWidth);
+        const top = clamp(pos.top, 0, window.innerHeight - trigger.offsetHeight);
+        trigger.style.left = left + 'px';
+        trigger.style.top = top + 'px';
+        trigger.style.right = 'auto';
+        trigger.style.bottom = 'auto';
+        if (left !== pos.left || top !== pos.top) {
+            pos.left = left;
+            pos.top = top;
+            saveSettingsDebounced();
+        }
     }
 
     // Feature-detect CSS Anchor Positioning
@@ -394,18 +402,7 @@ const init = ()=>{
 
     // Ensure the saved position stays visible on resize
     window.addEventListener('resize', () => {
-        const pos = extension_settings.worldInfoInfo?.triggerPos;
-        if (pos) {
-            const clampedLeft = clamp(pos.left, 0, window.innerWidth - trigger.offsetWidth);
-            const clampedTop = clamp(pos.top, 0, window.innerHeight - trigger.offsetHeight);
-            if (clampedLeft !== pos.left || clampedTop !== pos.top) {
-                pos.left = clampedLeft;
-                pos.top = clampedTop;
-                trigger.style.left = clampedLeft + 'px';
-                trigger.style.top = clampedTop + 'px';
-                saveSettingsDebounced();
-            }
-        }
+        clampSavedTriggerPosition();
 
         // After trigger potentially moved, place visible panels
         ensurePanelsVisible();
