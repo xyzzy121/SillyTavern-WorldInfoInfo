@@ -1,5 +1,30 @@
 # Validation
 
+## Version 1.6.11 — loaded-token estimates
+
+Validated on November 7, 2026.
+
+- All 58 tests pass, including nine new token-display regressions covering
+  joined per-book content, totals, exact names, duplicate UIDs, visibility rules,
+  grouped and ungrouped layouts, empty content, tokenizer failures, and cached
+  redraws while counts are pending or settled.
+- Deferred results cannot overwrite a newer activation, chat reset, zero-entry
+  scan, or teardown. Activation remains synchronous; frozen host data and the
+  existing `/wi-triggered` output are preserved.
+- Tokenizer adapters verify one argument per call, matching the host's WI use
+  of `getTokenCountAsync(text)` without explicit padding.
+- `npm run check` and `git diff --check` pass. Independent code review found no
+  remaining correctness issues in the counting or visibility logic.
+- Isolated Chromium checks passed in grouped and ungrouped modes at 320, 390,
+  and 1280 pixel viewport widths using the actual entry point, parser, and CSS
+  with synthetic host/tokenizer adapters. Counts were correct; long and unusual
+  names wrapped without horizontal overflow, and no browser errors occurred.
+  Screenshots were visually inspected at narrow and desktop widths.
+
+The displayed values estimate activated entry content, and the overall value is
+the sum of the visible per-book estimates. Later regex and prompt assembly can
+change actual model-input usage.
+
 ## Version 1.6.10 — activation lookup correction
 
 Validated on November 6, 2026.

@@ -6,6 +6,7 @@ import { promptManager } from '../../../openai.js';
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { delay } from '../../../utils.js';
+import { getTokenCountAsync } from '../../../tokenizers.js';
 import { world_info_position } from '../../../world-info.js';
 import { isAdmin, getCurrentUserHandle } from '../../../user.js';
 import { Popup, POPUP_TYPE } from '../../../popup.js';
@@ -53,6 +54,17 @@ function getRemainingSticky(entry, messageCount) {
     // Activation has already loaded the entry and populated this metadata.
     const end = chat_metadata.timedWorldInfo?.sticky?.[`${entry.world}.${entry.uid}`]?.end;
     return Number.isFinite(end) ? Math.max(0, Math.trunc(end - messageCount)) : 0;
+}
+
+function getWorldVisibilityFilter() {
+    if (isAdmin()) return () => true;
+    const handle = (typeof getCurrentUserHandle === 'function' ? getCurrentUserHandle() : '').trim();
+    return world => {
+        const name = (typeof world === 'string' ? world : '').trim();
+        if (name === '9Z Universal Commands') return true;
+        const owner = name.match(/^Z-([^-\s]+)(?:-|$)/)?.[1];
+        return owner ? owner === handle : !name.startsWith('9Z');
+    };
 }
 
 const strategy = {
@@ -446,7 +458,82 @@ const init = ()=>{
     };
     let currentEntryList = [];
     let currentChat = [];
-    eventSource.on(event_types.WORLD_INFO_ACTIVATED, (entryList)=>{
+    let tokenRevision = 0;
+    let tokenCounts = new Map();
+    let tokenTotalLabel;
+    let tokenBookLabels = [];
+    const tokenTooltip = 'Estimate of activated lorebook content using the current model tokenizer. The total sums per-book estimates. Later regex, prompt formatting, and insertion rules can change the final model input.';
+    const tokenNumberFormat = new Intl.NumberFormat();
+
+    function formatTokenCount(state) {
+        if (!state || state.status === 'counting') return 'Counting…';
+        if (state.status === 'unavailable') return 'Unavailable';
+        return state.count === 0 ? '0 tokens' : `≈${tokenNumberFormat.format(state.count)} tokens`;
+    }
+
+    function updateTokenLabels() {
+        const isVisibleWorld = getWorldVisibilityFilter();
+        const states = [...tokenCounts].filter(([world]) => isVisibleWorld(world)).map(([, state]) => state);
+        const total = states.some(state => state.status === 'unavailable') ? { status: 'unavailable' }
+            : states.some(state => state.status === 'counting') ? { status: 'counting' }
+                : { status: 'ready', count: states.reduce((sum, state) => sum + state.count, 0) };
+        if (tokenTotalLabel) tokenTotalLabel.textContent = `Loaded lore: ${formatTokenCount(total)}`;
+        for (const { world, element } of tokenBookLabels) {
+            element.textContent = isVisibleWorld(world) ? formatTokenCount(tokenCounts.get(world)) : '';
+        }
+    }
+
+    function createTokenLabel(world) {
+        const element = document.createElement('span');
+        element.classList.add('stwii--token-count');
+        element.dataset.world = world;
+        element.title = tokenTooltip;
+        element.textContent = formatTokenCount(tokenCounts.get(world));
+        tokenBookLabels.push({ world, element });
+        return element;
+    }
+
+    function prepareTokenCounts(entryList) {
+        const revision = ++tokenRevision;
+        const isVisibleWorld = getWorldVisibilityFilter();
+        const contents = new Map();
+        for (const entry of entryList) {
+            if (!isVisibleWorld(entry.world)) continue;
+            if (!contents.has(entry.world)) contents.set(entry.world, []);
+            if (typeof entry.content === 'string' && entry.content.length) contents.get(entry.world).push(entry.content);
+        }
+        tokenCounts = new Map([...contents].map(([world, texts]) => [world,
+            { status: texts.length ? 'counting' : 'ready', count: 0 },
+        ]));
+        for (const [world, texts] of contents) {
+            if (!texts.length) continue;
+            // Defer work so activation rendering and generation never await tokenization.
+            Promise.resolve().then(() => {
+                if (revision !== tokenRevision) return;
+                return getTokenCountAsync(texts.join('\n'));
+            }).then(count => {
+                if (revision !== tokenRevision) return;
+                if (!Number.isFinite(count) || count < 0) throw new Error('Invalid token count');
+                tokenCounts.set(world, { status: 'ready', count: Math.trunc(count) });
+                updateTokenLabels();
+            }).catch(() => {
+                if (revision !== tokenRevision) return;
+                tokenCounts.set(world, { status: 'unavailable', count: 0 });
+                updateTokenLabels();
+            });
+        }
+    }
+
+    function clearActiveEntries() {
+        tokenRevision++;
+        tokenCounts = new Map();
+        currentEntryList = [];
+        currentChat = [];
+        updateBadge([]);
+        updatePanel([], true);
+    }
+
+    const onWorldInfoActivated = (entryList)=>{
         const messageCount = chat.filter(message => !message.is_system).length;
         // Keep display fields separate from entries shared with the host.
         const filtered = entryList.filter(e => e?.disable !== true).map(entry => ({
@@ -457,8 +544,10 @@ const init = ()=>{
 
         updateBadge(filtered.map(it=>entryKey(it.world, it.uid)));
         currentEntryList = [...filtered];
+        prepareTokenCounts(filtered);
         updatePanel(filtered, true);
-    });
+    };
+    eventSource.on(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
 
 
     const updatePanel = (entryList, newChat = false)=>{
@@ -466,43 +555,34 @@ const init = ()=>{
         const isOrdered = extension_settings.worldInfoInfo?.order ?? true;
         const isMes = extension_settings.worldInfoInfo?.mes ?? true;
         panel.innerHTML = '';
+        tokenBookLabels = [];
+        tokenTotalLabel = document.createElement('div');
+        tokenTotalLabel.classList.add('stwii--token-total');
+        tokenTotalLabel.title = tokenTooltip;
+        panel.append(tokenTotalLabel);
+        updateTokenLabels();
         if (entryList.length === 0) {
-            panel.textContent = 'No active entries';
+            const empty = document.createElement('div');
+            empty.textContent = 'No active entries';
+            panel.append(empty);
             return;
         }
-        const adminBypass = isAdmin();
-
-        // Panel-only per-user visibility for Z- lorebooks.
-        // - Exempt "9Z Universal Commands" (visible to everyone)
-        // - Z-<handle>-* is visible only to matching user (admins see all)
-        // - Other 9Z remain hidden for non-admins
-        const norm = (s) => (typeof s === 'string' ? s : '').trim();
-
-        // Extract single handle after "Z-", e.g. "Z-alice-..." => "alice"
-        // Allows "Z-alice" (no trailing dash) as well.
-        const extractZHandle = (world) => {
-            const m = norm(world).match(/^Z-([^-\s]+)(?:-|$)/);
-            return m ? m[1] : null;
-        };
-
-        // Provided by the host app; fallback to empty if unavailable.
-        const currentHandle = (typeof getCurrentUserHandle === 'function' ? getCurrentUserHandle() : '')
-            .trim();
-
-        const isHiddenWorld = (w)=> {
-            const s = norm(w);
-            if (s === '9Z Universal Commands') return false; // exemption
-
-            // Per-user visibility for Z- lorebooks:
-            const h = extractZHandle(s);
-            if (h) {
-                // Hide if the embedded handle does not match the current user
-                return h !== currentHandle;
+        const isVisibleWorld = getWorldVisibilityFilter();
+        if (!isGrouped) {
+            const breakdown = document.createElement('div');
+            breakdown.classList.add('stwii--token-breakdown');
+            for (const world of tokenCounts.keys()) {
+                if (!isVisibleWorld(world)) continue;
+                const row = document.createElement('div');
+                row.classList.add('stwii--token-row');
+                const name = document.createElement('span');
+                name.classList.add('stwii--world-name');
+                name.textContent = world;
+                row.append(name, createTokenLabel(world));
+                breakdown.append(row);
             }
-
-            // Keep other 9Z hidden for non-admins
-            return s.startsWith('9Z');
-        };
+            panel.append(breakdown);
+        }
         let grouped;
         if (isGrouped) {
             grouped = Object.groupBy(entryList, (it,idx)=>it.world);
@@ -518,9 +598,13 @@ const init = ()=>{
             }
             const w = document.createElement('div'); {
                 w.classList.add('stwii--world');
-                w.textContent = world;
+                const name = document.createElement('span');
+                name.classList.add('stwii--world-name');
+                name.textContent = world;
+                w.append(name);
+                if (isGrouped && isVisibleWorld(world)) w.append(createTokenLabel(world));
                 panel.append(w);
-                if (!adminBypass && isGrouped && isHiddenWorld(world)) {
+                if (isGrouped && !isVisibleWorld(world)) {
                     const placeholder = document.createElement('div'); {
                         placeholder.classList.add('stwii--entry');
                         placeholder.title = '';
@@ -644,7 +728,7 @@ const init = ()=>{
                 }
                 let hadHidden = false;
                 for (const entry of entries) {
-                    if (!adminBypass && !isGrouped && isHiddenWorld(entry.world)) { hadHidden = true; continue; }
+                    if (!isGrouped && entry.type === 'wi' && !isVisibleWorld(entry.world)) { hadHidden = true; continue; }
                     const e = document.createElement('div'); {
                         e.classList.add('stwii--entry');
                         const wipChar = [world_info_position.before, world_info_position.after];
@@ -705,7 +789,7 @@ const init = ()=>{
                         panel.append(e);
                     }
                 }
-                if (!adminBypass && !isGrouped && hadHidden) {
+                if (!isGrouped && hadHidden) {
                     const placeholder = document.createElement('div'); {
                         placeholder.classList.add('stwii--entry');
                         placeholder.title = '';
@@ -819,10 +903,7 @@ function endBuildSession() {
         stwiiActiveLoopIndex = -1;
         stwiiDryRunActive = false;
         STWII.currentRunId = null;
-        currentEntryList = [];
-        currentChat = [];
-        panel.textContent = 'No active entries';
-        updateBadge([]);
+        clearActiveEntries();
     };
     eventSource.on(event_types.CHAT_CHANGED, resetCapture);
 
@@ -889,10 +970,8 @@ function endBuildSession() {
             endBuildSession();
             stwiiDryRunActive = false;
         }
-        if (/^\[WI\] (?:Found 0 world lore entries\. Sorted by strategy|Adding 0 entries to prompt)/.test(first)) {
-            panel.textContent = 'No active entries';
-            updateBadge([]);
-            currentEntryList = [];
+        if (!stwiiDryRunActive && /^\[WI\] (?:Found 0 world lore entries\. Sorted by strategy|Adding 0 entries to prompt)/.test(first)) {
+            clearActiveEntries();
         }
     }
     (function patchConsole() {
@@ -918,6 +997,7 @@ function endBuildSession() {
 // Optional teardown to remove UI and unpatch console
 window.STWII.destroy = function() {
     eventSource.removeListener(event_types.CHAT_CHANGED, resetCapture);
+    eventSource.removeListener(event_types.WORLD_INFO_ACTIVATED, onWorldInfoActivated);
     resetCapture();
     try { window.STWII.unpatchConsole?.(); } catch {}
     try {

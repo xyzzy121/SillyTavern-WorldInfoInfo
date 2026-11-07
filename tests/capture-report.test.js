@@ -11,6 +11,8 @@ class Element {
     children = [];
     classes = new Set();
     style = {};
+    dataset = {};
+    listeners = new Map();
     offsetWidth = 40;
     offsetHeight = 32;
     ownText = '';
@@ -20,7 +22,11 @@ class Element {
         contains: value => this.classes.has(value),
     };
     append(...children) { this.children.push(...children); }
-    addEventListener() {}
+    addEventListener(name, listener) {
+        if (!this.listeners.has(name)) this.listeners.set(name, []);
+        this.listeners.get(name).push(listener);
+    }
+    click() { for (const listener of this.listeners.get('click') ?? []) listener({ target: this }); }
     getBoundingClientRect() { return { left: 0, top: 0, right: 40, bottom: 32 }; }
     setAttribute() {}
     set innerHTML(value) { this.children = []; this.ownText = value; }
@@ -28,11 +34,12 @@ class Element {
     set textContent(value) { this.children = []; this.ownText = String(value); }
 }
 
-function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
+function fixture(admin = true, handle = 'alice', extensionSettings = {}, tokenizer = async text => text.length) {
     const commands = {};
     const metadata = {};
     const eventSource = new EventEmitter();
     const consoleCalls = [];
+    const tokenCalls = [];
     let popup = null;
     let saves = 0;
     const windowEvents = {};
@@ -51,6 +58,7 @@ function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
         saveSettingsDebounced() { saves++; },
         isAdmin: () => admin,
         getCurrentUserHandle: () => handle,
+        getTokenCountAsync(...args) { tokenCalls.push(args); return tokenizer(...args); },
         delay: async () => {},
         promptManager: {},
         SlashCommand: { fromProps: props => props },
@@ -62,10 +70,16 @@ function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
     const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8').replace(/^import .+;\r?\n/gm, '');
     runInNewContext(source, context);
     return {
-        context, metadata, eventSource, consoleCalls, commands,
+        context, metadata, eventSource, consoleCalls, commands, tokenCalls,
         get panel() { return context.window.STWII.panel; },
         activate(entries) { return eventSource.listeners('activated')[0](entries); },
         triggered() { return JSON.parse(commands['wi-triggered'].callback()); },
+        setSetting(name, value) {
+            const row = { group: 0, order: 1, mes: 2 }[name];
+            const checkbox = context.window.STWII.configPanel.children[row].children[0];
+            checkbox.checked = value;
+            checkbox.click();
+        },
         resize(width, height) {
             context.window.innerWidth = width;
             context.window.innerHeight = height;
@@ -86,6 +100,26 @@ function elementsWithClass(element, name) {
         ...(element.classes.has(name) ? [element] : []),
         ...element.children.flatMap(child => elementsWithClass(child, name)),
     ];
+}
+
+async function settleTokens() {
+    // Let the background tokenizer and its completion callbacks finish without
+    // relying on a particular number of chained promise reactions.
+    await new Promise(resolve => setImmediate(resolve));
+}
+
+function totalText(f) {
+    return elementsWithClass(f.panel, 'stwii--token-total')[0]?.textContent;
+}
+
+function bookTokenLabels(f) {
+    return new Map(elementsWithClass(f.panel, 'stwii--token-count').map(element => [element.dataset.world, element.textContent]));
+}
+
+function assertEmptyPanel(f) {
+    assert.equal(totalText(f), 'Loaded lore: 0 tokens');
+    assert.ok(f.panel.textContent.includes('No active entries'));
+    assert.equal(elementsWithClass(f.panel, 'stwii--entry').length, 0);
 }
 
 test('activated books absent from the file list render without a slash-command lookup', async () => {
@@ -113,7 +147,7 @@ test('activation renders exact names and separate countdowns for identical UIDs'
     await f.activate(entries);
     assert.deepEqual(f.triggered().map(entry => entry.world), names);
     assert.deepEqual(f.triggered().map(entry => entry.sticky), names.map((_, i) => i + 1));
-    assert.deepEqual(elementsWithClass(f.panel, 'stwii--world').map(element => element.textContent), names);
+    assert.deepEqual(elementsWithClass(f.panel, 'stwii--world-name').map(element => element.textContent), names);
     assert.deepEqual(elementsWithClass(f.panel, 'stwii--sticky').map(element => element.textContent), names.map((_, i) => `📌 ${i + 1}`));
 });
 
@@ -173,7 +207,7 @@ test('activation completes synchronously without a timed-effect command and clea
     f.eventSource.emit('chat');
     await Promise.resolve();
     assert.deepEqual(f.triggered(), []);
-    assert.equal(f.panel.textContent, 'No active entries');
+    assertEmptyPanel(f);
 });
 
 test('disabled and empty activation lists clear the previous entries and retain the empty placeholder', async () => {
@@ -184,8 +218,156 @@ test('disabled and empty activation lists clear the previous entries and retain 
     for (const entries of [[activeEntry('Disabled book', 2, { disable: true })], []]) {
         await f.activate(entries);
         assert.deepEqual(f.triggered(), []);
-        assert.equal(f.panel.textContent, 'No active entries');
+        assertEmptyPanel(f);
     }
+});
+
+test('token counts render asynchronously from joined entry content with no padding argument', async () => {
+    const f = fixture(true, 'alice', {}, async text => ({ 'first\nsecond': 11, other: 7 }[text]));
+    f.context.chat.push({ mes: 'Chat text must not count' });
+    f.metadata.notePrompt = 'Author note must not count';
+    const a = activeEntry("Scholar's: [book] 📚", 1, { content: 'first', comment: 'Title must not count' });
+    const b = activeEntry(a.world, 2, { content: 'second', key: ['Keyword must not count'] });
+    const c = activeEntry('  Other\nbook  ', 1, { content: 'other' });
+    assert.equal(f.activate([a, b, c]), undefined, 'activation stays synchronous');
+    assert.equal(totalText(f), 'Loaded lore: Counting…');
+    assert.ok(f.panel.textContent.includes('Title must not count'), 'entries render before tokenization completes');
+    assert.equal(f.tokenCalls.length, 0, 'tokenization begins after the synchronous activation handler');
+    await settleTokens();
+    assert.deepEqual(f.tokenCalls, [['first\nsecond'], ['other']]);
+    assert.equal(totalText(f), 'Loaded lore: ≈18 tokens');
+    assert.deepEqual([...bookTokenLabels(f)], [[a.world, '≈11 tokens'], [c.world, '≈7 tokens']]);
+});
+
+test('token counts preserve exact lorebook identities even when names differ only by whitespace or case', async () => {
+    const f = fixture();
+    const names = ['Book', ' Book ', 'book', '星\nCafe\u0301', '__proto__', ''];
+    f.activate(names.map((world, i) => activeEntry(world, 1, { content: 'x'.repeat(i + 1) })));
+    await settleTokens();
+    assert.deepEqual([...bookTokenLabels(f)], names.map((world, i) => [world, `≈${i + 1} tokens`]));
+    assert.equal(totalText(f), 'Loaded lore: ≈21 tokens');
+});
+
+test('visible token totals follow admin and hidden-lorebook rules in both panel layouts', async () => {
+    const entries = ['Public', '9Z hidden', '9Z Universal Commands', 'Z-alice-notes', 'Z-bob-notes']
+        .map(world => activeEntry(world, 1, { content: world }));
+    entries.push(activeEntry('Disabled', 2, { content: 'disabled', disable: true }));
+    for (const admin of [false, true]) {
+        for (const group of [false, true]) {
+            const f = fixture(admin, 'alice', { worldInfoInfo: { group, mes: false } }, async () => 2);
+            f.activate(entries);
+            await settleTokens();
+            const expected = admin ? entries.slice(0, 5) : [entries[0], entries[2], entries[3]];
+            assert.deepEqual(f.tokenCalls.map(args => args[0]), expected.map(entry => entry.content));
+            assert.deepEqual([...bookTokenLabels(f).keys()], expected.map(entry => entry.world));
+            assert.equal(totalText(f), `Loaded lore: ≈${expected.length * 2} tokens`);
+            assert.equal(elementsWithClass(f.panel, 'stwii--token-breakdown').length, group ? 0 : 1);
+        }
+    }
+});
+
+test('empty content and empty activations show zero without calling the tokenizer', async () => {
+    const f = fixture();
+    f.activate([activeEntry('Empty', 1, { content: '' }), activeEntry('Empty', 2, { content: undefined })]);
+    await settleTokens();
+    assert.deepEqual(f.tokenCalls, []);
+    assert.equal(totalText(f), 'Loaded lore: 0 tokens');
+    assert.equal(bookTokenLabels(f).get('Empty'), '0 tokens');
+    f.activate([]);
+    await settleTokens();
+    assertEmptyPanel(f);
+    assert.deepEqual(f.tokenCalls, []);
+});
+
+test('tokenizer failures leave entries usable and successful book counts visible', async () => {
+    for (const failure of [new Error('Tokenizer unavailable'), NaN, Infinity, -1]) {
+        const f = fixture(true, 'alice', {}, async text => {
+            if (text === 'good') return 4;
+            if (failure instanceof Error) throw failure;
+            return failure;
+        });
+        f.activate([activeEntry('Good book', 1, { content: 'good' }), activeEntry('Failed book', 1, { content: 'bad' })]);
+        await settleTokens();
+        assert.equal(totalText(f), 'Loaded lore: Unavailable');
+        assert.deepEqual([...bookTokenLabels(f)], [['Good book', '≈4 tokens'], ['Failed book', 'Unavailable']]);
+        assert.equal(f.triggered().length, 2);
+        assert.ok(f.panel.textContent.includes('Entry 1'));
+    }
+});
+
+test('settings redraws retain pending and settled counts with a per-book breakdown when ungrouped', async () => {
+    let resolve;
+    const f = fixture(true, 'alice', { worldInfoInfo: { mes: false } }, () => new Promise(done => { resolve = done; }));
+    f.activate([activeEntry()]);
+    await settleTokens();
+    f.setSetting('group', false);
+    assert.equal(totalText(f), 'Loaded lore: Counting…');
+    assert.equal(bookTokenLabels(f).get('Working book'), 'Counting…');
+    resolve(1234);
+    await settleTokens();
+    assert.equal(totalText(f), 'Loaded lore: ≈1,234 tokens');
+    f.setSetting('order', false);
+    await settleTokens();
+    assert.equal(f.tokenCalls.length, 1);
+    assert.equal(totalText(f), 'Loaded lore: ≈1,234 tokens');
+    assert.equal(bookTokenLabels(f).get('Working book'), '≈1,234 tokens');
+    const [breakdown] = elementsWithClass(f.panel, 'stwii--token-breakdown');
+    assert.ok(breakdown.textContent.includes('Working book'));
+    assert.ok(breakdown.textContent.includes('≈1,234 tokens'));
+});
+
+test('a late count from an older activation cannot replace the newest panel count', async () => {
+    const pending = new Map();
+    const f = fixture(true, 'alice', {}, text => new Promise(resolve => pending.set(text, resolve)));
+    f.activate([activeEntry('Old', 1, { content: 'old' })]);
+    await settleTokens();
+    f.activate([activeEntry('New', 1, { content: 'new' })]);
+    await settleTokens();
+    pending.get('new')(9);
+    await settleTokens();
+    assert.equal(totalText(f), 'Loaded lore: ≈9 tokens');
+    pending.get('old')(99);
+    await settleTokens();
+    assert.equal(totalText(f), 'Loaded lore: ≈9 tokens');
+    assert.deepEqual([...bookTokenLabels(f)], [['New', '≈9 tokens']]);
+    assert.deepEqual(f.triggered().map(entry => entry.world), ['New']);
+});
+
+test('chat changes, zero-entry scans, and teardown invalidate pending token counts', async () => {
+    const clearActions = [
+        f => f.eventSource.emit('chat'),
+        f => f.log('[WI] Adding 0 entries to prompt'),
+        f => f.context.window.STWII.destroy(),
+    ];
+    for (const clear of clearActions) {
+        let resolve;
+        const f = fixture(true, 'alice', {}, () => new Promise(done => { resolve = done; }));
+        f.activate([activeEntry()]);
+        await settleTokens();
+        clear(f);
+        const afterClear = f.panel.textContent;
+        assertEmptyPanel(f);
+        resolve(100);
+        await settleTokens();
+        assert.equal(f.panel.textContent, afterClear);
+        assert.deepEqual(f.triggered(), []);
+    }
+});
+
+test('token counting preserves frozen host data and the existing wi-triggered schema', async () => {
+    const f = fixture();
+    f.metadata.noteDepth = 2;
+    const entry = Object.freeze(activeEntry('Frozen', 1, { key: Object.freeze(['key']), content: 'payload' }));
+    const original = JSON.stringify(entry);
+    const metadataKeys = Object.keys(f.metadata);
+    f.activate(Object.freeze([entry]));
+    const beforeCount = f.triggered();
+    await settleTokens();
+    assert.equal(JSON.stringify(entry), original);
+    assert.deepEqual(f.triggered(), beforeCount);
+    assert.deepEqual(Object.keys(f.metadata), metadataKeys);
+    assert.ok(!Object.keys(f.triggered()[0]).some(key => /token/i.test(key)));
+    assert.equal(totalText(f), 'Loaded lore: ≈7 tokens');
 });
 
 test('a saved desktop trigger position is visible on the first phone load and after rotation', () => {

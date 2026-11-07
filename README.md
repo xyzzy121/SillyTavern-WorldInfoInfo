@@ -22,6 +22,23 @@ Visibility and privacy
 
 ![report omits hidden books](https://github.com/aikohanasaki/imagehost/blob/main/wii-hiddenreport.png)
 
+## Loaded-token estimates (1.6.11)
+
+The activity panel shows a small token estimate beside each lorebook and a
+`Loaded lore` total above the entries. With grouping disabled, the per-book
+breakdown appears below the total. The total is the sum of the visible books'
+estimates; disabled entries and lorebooks hidden from the current user are
+excluded.
+
+Counts use SillyTavern's current tokenizer on each book's activated entry content
+after macro substitution, with a newline between entries. The `≈` marker means
+these are content estimates: later regex, prompt formatting, message framing, and
+whether an outlet is used can change the tokens actually sent to the model.
+Titles, keywords, displayed chat messages, and Author's Note text are excluded.
+
+The panel remains usable while estimates show `Counting…`. Tokenizer failures
+show `Unavailable` without blocking generation; empty content counts as zero.
+
 ## Lorebook-name warnings during generation (1.6.10)
 
 The activity panel now reads sticky countdowns from the host's existing chat

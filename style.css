@@ -293,3 +293,38 @@
 .stwii--sticky {
   flex-shrink: 0;
 }
+
+/* Keep token estimates compact while allowing long book names to wrap. */
+.stwii--token-total {
+  margin-bottom: 0.35em;
+  font-size: 0.9em;
+  opacity: 0.8;
+}
+.stwii--world,
+.stwii--token-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.15em 0.75em;
+}
+.stwii--world-name {
+  flex: 1 1 8em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.stwii--token-count {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+  font-weight: normal;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+.stwii--token-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+  min-width: 0;
+  margin: 0 0 0.5em 0.5em;
+}
