@@ -48,6 +48,13 @@ function trimBuilds() {
     } catch {}
 }
 
+function getRemainingSticky(entry, messageCount) {
+    // Use the host's timed-effect key, which differs from our report IDs.
+    // Activation has already loaded the entry and populated this metadata.
+    const end = chat_metadata.timedWorldInfo?.sticky?.[`${entry.world}.${entry.uid}`]?.end;
+    return Number.isFinite(end) ? Math.max(0, Math.trunc(end - messageCount)) : 0;
+}
+
 const strategy = {
     constant: '🔵',
     normal: '🟢',
@@ -439,36 +446,17 @@ const init = ()=>{
     };
     let currentEntryList = [];
     let currentChat = [];
-    eventSource.on(event_types.WORLD_INFO_ACTIVATED, async(entryList)=>{
-        panel.innerHTML = 'Updating...';
-
-        // Exclude disabled entries
-        const filtered = entryList.filter(e => e?.disable !== true);
+    eventSource.on(event_types.WORLD_INFO_ACTIVATED, (entryList)=>{
+        const messageCount = chat.filter(message => !message.is_system).length;
+        // Keep display fields separate from entries shared with the host.
+        const filtered = entryList.filter(e => e?.disable !== true).map(entry => ({
+            ...entry,
+            type: 'wi',
+            sticky: getRemainingSticky(entry, messageCount),
+        }));
 
         updateBadge(filtered.map(it=>entryKey(it.world, it.uid)));
-
-        for (const entry of filtered) {
-            entry.type = 'wi';
-            entry.sticky = parseInt(/**@type {string}*/(await SlashCommandParser.commands['wi-get-timed-effect'].callback(
-                {
-                    effect: 'sticky',
-                    format: 'number',
-                    file: `${entry.world}`,
-                    _scope: null,
-                    _abortController: null,
-                },
-                entry.uid,
-            )));
-        }
-
         currentEntryList = [...filtered];
-
-        if (filtered.length === 0) {
-            panel.innerHTML = 'No active entries';
-            updatePanel(filtered, true);
-            return;
-        }
-
         updatePanel(filtered, true);
     });
 
@@ -478,6 +466,10 @@ const init = ()=>{
         const isOrdered = extension_settings.worldInfoInfo?.order ?? true;
         const isMes = extension_settings.worldInfoInfo?.mes ?? true;
         panel.innerHTML = '';
+        if (entryList.length === 0) {
+            panel.textContent = 'No active entries';
+            return;
+        }
         const adminBypass = isAdmin();
 
         // Panel-only per-user visibility for Z- lorebooks.

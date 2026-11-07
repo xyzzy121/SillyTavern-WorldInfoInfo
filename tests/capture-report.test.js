@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import * as parser from '../wi-log-parser.js';
 
 // Run the extension entry point with host/DOM adapters. This exercises console
-// boundaries and the actual report callback without needing a running server.
+// boundaries, activation panel, and report callbacks without a running server.
 class Element {
     children = [];
     classes = new Set();
@@ -43,7 +43,9 @@ function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
         CSS: { supports: () => false },
         document: { createElement: () => new Element(), body: new Element() },
         chat: [], chat_metadata: metadata, main_api: 'openai',
-        extension_settings: extensionSettings, metadata_keys: {}, world_info_position: {},
+        extension_settings: extensionSettings,
+        metadata_keys: { depth: 'noteDepth', prompt: 'notePrompt' },
+        world_info_position: { before: 0, after: 1, ANTop: 2, ANBottom: 3, atDepth: 4, EMTop: 5, EMBottom: 6 },
         event_types: { GENERATION_STARTED: 'generation', CHAT_CHANGED: 'chat', WORLD_INFO_ACTIVATED: 'activated' },
         eventSource,
         saveSettingsDebounced() { saves++; },
@@ -60,7 +62,10 @@ function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
     const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8').replace(/^import .+;\r?\n/gm, '');
     runInNewContext(source, context);
     return {
-        context, metadata, eventSource, consoleCalls,
+        context, metadata, eventSource, consoleCalls, commands,
+        get panel() { return context.window.STWII.panel; },
+        activate(entries) { return eventSource.listeners('activated')[0](entries); },
+        triggered() { return JSON.parse(commands['wi-triggered'].callback()); },
         resize(width, height) {
             context.window.innerWidth = width;
             context.window.innerHeight = height;
@@ -71,6 +76,117 @@ function fixture(admin = true, handle = 'alice', extensionSettings = {}) {
         async report() { await commands['wi-report'].callback(); return popup.textContent; },
     };
 }
+
+function activeEntry(world = 'Working book', uid = 1, overrides = {}) {
+    return { world, uid, key: ['trigger'], comment: `Entry ${uid}`, content: 'Entry content', position: 0, depth: 7, order: 100, sticky: 5, ...overrides };
+}
+
+function elementsWithClass(element, name) {
+    return [
+        ...(element.classes.has(name) ? [element] : []),
+        ...element.children.flatMap(child => elementsWithClass(child, name)),
+    ];
+}
+
+test('activated books absent from the file list render without a slash-command lookup', async () => {
+    const f = fixture();
+    const warnings = [];
+    f.context.world_names = [];
+    f.commands['wi-get-timed-effect'] = { callback() {
+        warnings.push('Valid World Info file name is required');
+        throw new Error('The display must not reload an already activated book');
+    } };
+    const entry = activeEntry("Already activated book's [name]");
+    f.metadata.timedWorldInfo = { sticky: { [`${entry.world}.${entry.uid}`]: { end: 4 } } };
+    await f.activate([entry]);
+    assert.deepEqual(warnings, []);
+    assert.ok(f.panel.textContent.includes(entry.world));
+    assert.ok(f.panel.textContent.includes('📌 4'));
+    assert.equal(f.triggered()[0].sticky, 4);
+});
+
+test('activation renders exact names and separate countdowns for identical UIDs', async () => {
+    const f = fixture();
+    const names = ["Scholar's: [book]", 'The "Glass" book', '星 📚 Cafe\u0301', 'two\nlines\tand tabs', 'Book', ' Book ', 'book', '?', '', '__proto__'];
+    const entries = names.map(world => activeEntry(world));
+    f.metadata.timedWorldInfo = { sticky: Object.fromEntries(names.map((world, i) => [`${world}.1`, { end: i + 1 }])) };
+    await f.activate(entries);
+    assert.deepEqual(f.triggered().map(entry => entry.world), names);
+    assert.deepEqual(f.triggered().map(entry => entry.sticky), names.map((_, i) => i + 1));
+    assert.deepEqual(elementsWithClass(f.panel, 'stwii--world').map(element => element.textContent), names);
+    assert.deepEqual(elementsWithClass(f.panel, 'stwii--sticky').map(element => element.textContent), names.map((_, i) => `📌 ${i + 1}`));
+});
+
+test('remaining sticky duration counts only non-system messages and is an integer', async () => {
+    const f = fixture();
+    f.context.chat.push({ mes: 'User message' }, { is_system: true, mes: 'System message' }, { is_system: false, mes: 'Assistant message' });
+    f.metadata.timedWorldInfo = { sticky: { 'Working book.1': { start: 0, end: 8.75 } } };
+    await f.activate([activeEntry()]);
+    assert.equal(f.triggered()[0].sticky, 6);
+    assert.ok(f.panel.textContent.includes('📌 6'));
+});
+
+test('missing, malformed, and expired sticky metadata leave entries visible without an indicator', async () => {
+    const cases = [
+        undefined, null, {}, { sticky: null }, { sticky: {} },
+        ...[null, false, 'invalid', {}, { end: null }, { end: '8' }, { end: NaN }, { end: Infinity }, { end: -Infinity }, { end: 0 }, { end: 1 }, { end: -4 }]
+            .map(effect => ({ sticky: { 'Working book.1': effect } })),
+    ];
+    for (const metadata of cases) {
+        const f = fixture();
+        f.context.chat.push({ mes: 'First' }, { mes: 'Second' });
+        f.metadata.timedWorldInfo = metadata;
+        await f.activate([activeEntry()]);
+        assert.equal(f.triggered()[0].sticky, 0);
+        assert.ok(f.panel.textContent.includes('Working book'));
+        assert.ok(f.panel.textContent.includes('Entry 1'));
+        assert.equal(elementsWithClass(f.panel, 'stwii--sticky')[0].textContent, '');
+        assert.ok(!f.panel.textContent.includes('NaN'));
+    }
+});
+
+test('activation and rendering preserve frozen host entries and timed-effect metadata', async () => {
+    const f = fixture();
+    f.metadata.noteDepth = 2;
+    const entry = Object.freeze(activeEntry('Frozen book', 1, { key: Object.freeze(['trigger']), position: 2 }));
+    const original = JSON.stringify(entry);
+    f.metadata.timedWorldInfo = Object.freeze({ sticky: Object.freeze({ 'Frozen book.1': Object.freeze({ end: 3 }) }) });
+    await f.activate(Object.freeze([entry]));
+    assert.equal(JSON.stringify(entry), original);
+    assert.equal(f.metadata.timedWorldInfo.sticky['Frozen book.1'].end, 3);
+    const [displayEntry] = f.triggered();
+    assert.equal(displayEntry.type, 'wi');
+    assert.equal(displayEntry.sticky, 3);
+    assert.equal(displayEntry.depth, 2.1);
+    assert.equal(entry.sticky, 5);
+    assert.equal(entry.depth, 7);
+    assert.ok(!Object.hasOwn(entry, 'type'));
+});
+
+test('activation completes synchronously without a timed-effect command and clears on chat change', async () => {
+    const f = fixture();
+    assert.ok(!Object.hasOwn(f.commands, 'wi-get-timed-effect'));
+    const result = f.activate([activeEntry()]);
+    await result;
+    assert.equal(result, undefined);
+    assert.equal(f.triggered().length, 1);
+    f.eventSource.emit('chat');
+    await Promise.resolve();
+    assert.deepEqual(f.triggered(), []);
+    assert.equal(f.panel.textContent, 'No active entries');
+});
+
+test('disabled and empty activation lists clear the previous entries and retain the empty placeholder', async () => {
+    const f = fixture();
+    await f.activate([activeEntry(), activeEntry('Disabled book', 2, { disable: true })]);
+    assert.deepEqual(f.triggered().map(entry => entry.world), ['Working book']);
+    assert.ok(!f.panel.textContent.includes('Disabled book'));
+    for (const entries of [[activeEntry('Disabled book', 2, { disable: true })], []]) {
+        await f.activate(entries);
+        assert.deepEqual(f.triggered(), []);
+        assert.equal(f.panel.textContent, 'No active entries');
+    }
+});
 
 test('a saved desktop trigger position is visible on the first phone load and after rotation', () => {
     const settings = { worldInfoInfo: { triggerPos: { left: 1100, top: 900 } } };

@@ -1,5 +1,27 @@
 # Validation
 
+## Version 1.6.10 — activation lookup correction
+
+Validated on November 6, 2026.
+
+- Added seven activation-handler regression tests. All seven failed against the
+  previous implementation; all 49 tests pass with the correction.
+- Activated entries render without calling `/wi-get-timed-effect`, including
+  books absent from the host's file list and hosts without that command.
+- Exact names and identical UIDs in different books retain separate countdowns.
+  Non-system message counting, integer durations, missing/malformed/expired
+  effects, frozen host data, chat changes, disabled entries, and empty lists are
+  covered through the actual event handler and panel renderer.
+- The metadata key and countdown calculation were checked against both local
+  SillyTavern host sources. The host populates timed effects before emitting the
+  activation event; no file lookup is needed to display them.
+- `npm run check` passes for the entry point and shared parser.
+- `git diff --check` reports no whitespace errors.
+
+These checks use the host/DOM test adapters, not a running browser session. The
+requested extension checkout was updated; installation and verification in a
+running SillyTavern instance remain separate steps.
+
 ## Version 1.6.9 — mobile position correction
 
 Updated September 23, 2026. A saved icon position from a larger screen is now

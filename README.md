@@ -22,6 +22,19 @@ Visibility and privacy
 
 ![report omits hidden books](https://github.com/aikohanasaki/imagehost/blob/main/wii-hiddenreport.png)
 
+## Lorebook-name warnings during generation (1.6.10)
+
+The activity panel now reads sticky countdowns from the host's existing chat
+metadata. Previously it called `/wi-get-timed-effect` for every activated entry,
+which checked the lorebook's name against the file list and reloaded the book.
+That extra lookup could report "Valid World Info file name is required" for an
+entry that had already activated successfully, or leave the panel on "Updating..."
+if the command failed.
+
+Lorebook names are preserved exactly. Missing or incompatible timed-effect
+metadata simply leaves out the sticky indicator. Display updates use copies of
+activated entries, preserving the host's configured sticky durations and depths.
+
 ## Unusual lorebook names (1.6.8)
 
 Activation capture now uses the host's structured lorebook name and entry UID
